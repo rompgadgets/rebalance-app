@@ -1,28 +1,24 @@
 // rust imports
-
 use std::cmp::Ordering;
 use std::io::Write;
 
 // 3rd-party imports
-
 use num::traits::cast::FromPrimitive;
 use num::BigRational;
 use num::{One, Zero};
 use num::{Signed, ToPrimitive};
 
-use chrono::prelude::*;
-
 use tabwriter::TabWriter;
 
 pub struct Asset {
-    name: String,
-    value: BigRational,
-    actual_allocation: BigRational,
-    target_allocation_percent: BigRational,
+    pub name: String,
+    pub value: BigRational,
+    pub actual_allocation: BigRational,
+    pub target_allocation_percent: BigRational,
 
-    target_value: Option<BigRational>,
-    deviation: Option<BigRational>,
-    delta: Option<BigRational>,
+    pub target_value: Option<BigRational>,
+    pub deviation: Option<BigRational>,
+    pub delta: Option<BigRational>,
 }
 
 impl Asset {
@@ -44,7 +40,7 @@ impl Asset {
     }
 }
 
-fn comparator(left: &Asset, right: &Asset) -> Ordering {
+pub fn comparator(left: &Asset, right: &Asset) -> Ordering {
     if left.deviation < right.deviation {
         return Ordering::Less;
     }
@@ -56,7 +52,7 @@ fn comparator(left: &Asset, right: &Asset) -> Ordering {
     Ordering::Equal
 }
 
-pub fn lazy_rebalance(amount_to_contribute: f64, mut assets: Vec<Asset>) -> Vec<Asset> {
+pub fn lazy_rebalance(amount_to_contribute: f64, assets: &mut Vec<Asset>) -> &mut Vec<Asset> {
     let amount_to_contribute = BigRational::from_f64(amount_to_contribute).unwrap();
 
     let portfolio_total: BigRational = assets
@@ -80,6 +76,7 @@ pub fn lazy_rebalance(amount_to_contribute: f64, mut assets: Vec<Asset>) -> Vec<
 
         asset.target_value = Some(target_value);
         asset.deviation = Some(deviation);
+        asset.delta = Some(BigRational::zero());
     }
 
     assets.sort_by(|left, right| {
@@ -172,7 +169,7 @@ pub fn lazy_rebalance(amount_to_contribute: f64, mut assets: Vec<Asset>) -> Vec<
     assets
 }
 
-fn to_f64(fraction: &BigRational) -> f64 {
+pub fn to_f64(fraction: &BigRational) -> f64 {
     let numerator = fraction.numer();
     let denominator = fraction.denom();
 
@@ -252,12 +249,10 @@ fn to_f64(fraction: &BigRational) -> f64 {
 //     String::from_utf8(tw.into_inner().unwrap()).unwrap()
 // }
 
-pub fn to_ledger_string(
-    balanced_portfolio: &Vec<Asset>,
-    dest_account_name: &str,
-    source_account_name: &str,
-) -> String {
-    let mut buf: String = "".to_string();
+/// Function to create the vector representation for display the balanced portfolio
+/// in a tui stateful table
+pub fn to_vec_display(balanced_portfolio: &Vec<Asset>) -> Vec<Vec<String>> {
+    let mut display = Vec::<Vec<String>>::new();
 
     for asset in balanced_portfolio {
         let delta = match asset.delta {
@@ -265,53 +260,22 @@ pub fn to_ledger_string(
             None => BigRational::zero(),
         };
 
-        if delta == BigRational::zero() {
-            continue;
-        }
+        let actual_allocation = &asset.actual_allocation * BigRational::from_f64(100.00).unwrap();
+        let target_value = &(asset.target_value.clone()).unwrap();
+        let final_portion =
+            (&asset.value + &delta) * &asset.target_allocation_percent / target_value;
+        let final_portion = &final_portion * BigRational::from_f64(100.00).unwrap();
 
-        let date_time_now = Local::now().format("%Y-%m-%d").to_string();
-
-        let amount_to_contribute = format_f64(to_f64(&delta), 2);
-        let amount_to_withdraw = format_f64(-to_f64(&delta), 2);
-
-        let line: String = if delta <= BigRational::zero() {
-            format!(
-                r#"
-{date} * Withdrawal from {account_name}
-    {dest_account_name:76}{amount_to_contribute} CAD
-    {source_account_name:76}{amount_to_withdraw} CAD
-    "#,
-                date = date_time_now,
-                account_name = asset.name,
-                dest_account_name = dest_account_name,
-                amount_to_contribute = amount_to_contribute,
-                source_account_name = source_account_name,
-                amount_to_withdraw = amount_to_withdraw
-            )
-            .trim()
-            .to_string()
-        } else {
-            format!(
-                r#"
-{date} * Contribution to {account_name}
-    {dest_account_name:76}{amount_to_contribute} CAD
-    {source_account_name:76}{amount_to_withdraw} CAD
-    "#,
-                date = date_time_now,
-                account_name = asset.name,
-                dest_account_name = dest_account_name,
-                amount_to_contribute = amount_to_contribute,
-                source_account_name = source_account_name,
-                amount_to_withdraw = amount_to_withdraw
-            )
-            .trim()
-            .to_string()
-        };
-
-        buf = format!("{}\n{}\n", buf, line);
+        display.push(vec![
+            asset.name.clone().to_string(),
+            format_f64(to_f64(&actual_allocation), 3),
+            format_f64(to_f64(&final_portion), 3),
+            format_f64(to_f64(&target_value), 2),
+            format_f64(to_f64(&delta), 2),
+        ]);
     }
 
-    return buf.to_string();
+    display
 }
 
 pub fn to_string(balanced_portfolio: &Vec<Asset>) -> String {
@@ -324,7 +288,7 @@ pub fn to_string(balanced_portfolio: &Vec<Asset>) -> String {
     let mut total_new_holdings = BigRational::zero();
     let mut total_target_allocation = BigRational::zero();
     let mut total_target_value = BigRational::zero();
-    let mut total_contribution = 0.0;
+    let mut total_contribution = BigRational::zero();
 
     for asset in balanced_portfolio {
         let delta = match asset.delta {
@@ -355,11 +319,9 @@ pub fn to_string(balanced_portfolio: &Vec<Asset>) -> String {
         total_new_holdings = total_new_holdings + &final_portion;
         total_target_allocation = total_target_allocation + &target_allocation_percent;
         total_target_value = total_target_value + target_value;
-        let actual_delta = (to_f64(&delta) * 100.0).round() / 100.0;
-        total_contribution = total_contribution + actual_delta;
+        total_contribution = total_contribution + &delta;
 
         // generate line
-
         let line = format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}",
             asset.name,
@@ -368,7 +330,7 @@ pub fn to_string(balanced_portfolio: &Vec<Asset>) -> String {
             format_f64(to_f64(&final_portion), 3),
             format_f64(to_f64(&target_allocation_percent), 3),
             format_f64(to_f64(&target_value), 2),
-            format_f64(actual_delta, 2)
+            format_f64(to_f64(&delta), 2)
         );
 
         buf = format!("{}\n{}", buf, line);
@@ -381,7 +343,7 @@ pub fn to_string(balanced_portfolio: &Vec<Asset>) -> String {
         format_f64(to_f64(&total_new_holdings), 3),
         format_f64(to_f64(&total_target_allocation), 3),
         format_f64(to_f64(&total_target_value), 2),
-        format_f64(total_contribution, 2)
+        format_f64(to_f64(&total_contribution), 2)
     );
 
     buf = format!("{}\n{}", buf, total_line);
@@ -394,6 +356,6 @@ pub fn to_string(balanced_portfolio: &Vec<Asset>) -> String {
     String::from_utf8(tw.into_inner().unwrap()).unwrap()
 }
 
-fn format_f64(price: f64, dec_places: usize) -> String {
+pub fn format_f64(price: f64, dec_places: usize) -> String {
     format!("{:.*}", dec_places, price)
 }

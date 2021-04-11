@@ -1,261 +1,168 @@
-extern crate chrono;
-extern crate clap;
-extern crate csv;
-extern crate num;
-extern crate tabwriter;
+#[allow(dead_code)]
+mod util;
 
-mod rebalance;
+use crate::util::{
+    app::App,
+    event::{Event, Events},
+    ui,
+};
+use regex::Regex;
+use std::{
+    error::Error,
+    io::{self},
+};
+use termion::{event::Key, input::MouseTerminal, raw::IntoRawMode, screen::AlternateScreen};
+use tui::{backend::TermionBackend, Terminal};
+use util::app::InputMode;
 
-// rust imports
+fn main() -> Result<(), Box<dyn Error>> {
+    // Terminal initialization
+    let stdout = io::stdout().into_raw_mode()?;
+    let stdout = MouseTerminal::from(stdout);
+    let stdout = AlternateScreen::from(stdout);
+    let backend = TermionBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
 
-use std::collections::HashMap;
+    let mut events = Events::new();
 
-// 3rd-party imports
+    let mut app = App::new();
+    //not used right now but will eventually be used to edit portfolio target allocations
+    let mut toggle: bool = false;
 
-use clap::{App, AppSettings, Arg};
+    // Validate that input matches a dollar amount e.g. 1000.00
+    let input_validation = Regex::new(r"^\d+[.]?\d{2}?$").unwrap();
 
-// local imports
+    loop {
+        terminal.draw(|f| ui::draw(f, &mut app))?;
 
-use rebalance::{lazy_rebalance, to_ledger_string, to_string, Asset};
+        //Event loop to handle the three modes (Input, Edit, and Exec)
+        match events.next()? {
+            Event::Input(input) => match app.input_mode {
+                util::app::InputMode::Normal => match input {
+                    Key::Char('e') => {
+                        app.input_mode = util::app::InputMode::Editing;
+                        events.disable_exit_key();
+                    }
+                    Key::Char('r') => {
+                        app.input_mode = util::app::InputMode::Exec;
+                        events.disable_exit_key();
+                    }
+                    Key::Char('q') => {
+                        break;
+                    }
+                    Key::Left => {
+                        app.items.unselect();
+                    }
+                    Key::Down => {
+                        if toggle {
+                            app.items.next();
+                        } else {
+                            app.table_portfolio.next();
+                        }
+                    }
+                    Key::Up => {
+                        if toggle {
+                            app.items.previous();
+                        } else {
+                            app.table_portfolio.previous();
+                        }
+                    }
+                    Key::Char(c) => {
+                        //let event_str = format!("{} pressed ({:x})", c, c as u8);
+                        //app.add_custom_event(event_str);
+                        // picks up the keycode for tab
+                        if c as u8 == 9 {
+                            toggle = !toggle;
+                        }
+                    }
+                    Key::Backspace => {
+                        toggle = !toggle;
+                        app.add_custom_event("Backspace PRESSED".to_string());
+                    }
+                    _ => {}
+                },
+                util::app::InputMode::Editing => match input {
+                    Key::Char('\n') => {
+                        //pull the new portfolio amount
+                        let new_value: String = app.input.drain(..).collect();
 
-// app
+                        //validate the input to be a dollar amount
+                        if !input_validation.is_match(&new_value) {
+                            app.error_msg =
+                                "Input must be in the format of a dollar amount".to_string();
+                            app.input_mode = util::app::InputMode::ErrorDisplay;
+                        } else {
+                            if let Some(index) = app.table_portfolio.state.selected() {
+                                let row = &mut app.table_portfolio.items[index];
+                                row[1] = format!("${}", new_value.clone());
+                                //update the underlying asset
+                                app.update_asset(index, new_value);
+                            }
+                            app.input_mode = InputMode::Normal;
+                            events.enable_exit_key();
+                        }
+                    }
+                    Key::Char(c) => {
+                        app.input.push(c);
+                    }
+                    Key::Backspace => {
+                        app.input.pop();
+                    }
+                    Key::Esc => {
+                        app.input_mode = InputMode::Normal;
+                        events.enable_exit_key();
+                    }
+                    _ => {}
+                },
+                util::app::InputMode::Exec => match input {
+                    Key::Char('\n') => {
+                        //get the rebalance amount
+                        let new_investment: String = app.input.drain(..).collect();
 
-fn main() {
-    let matches = App::new("rebalance-app")
-        .version("1.2.0")
-        .author("Alberto Leal (github.com/dashed) <mailforalberto@gmail.com>")
-        .about("Optimal lazy portfolio rebalancing calculator")
-        .setting(AppSettings::AllowNegativeNumbers)
-        .arg(
-            Arg::with_name("targets")
-                .short("t")
-                .long("targets")
-                .value_name("FILE")
-                .help("Sets a targets file")
-                .required(true)
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("portfolio")
-                .short("p")
-                .long("portfolio")
-                .value_name("FILE")
-                .help("Sets a portfolio file")
-                .required(true)
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("portfolio_value_index")
-                .short("i")
-                .long("portfolio_value_index")
-                .value_name("INDEX")
-                .help("Sets CSV index of the portfolio value")
-                .required(false)
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("contribution")
-                .help("Sets the contribution amount")
-                .required(true)
-                .index(1),
-        )
-        .arg(
-            Arg::with_name("ledger")
-                .short("l")
-                .long("ledger")
-                .value_name("LEDGER")
-                .help("Display as ledger")
-                .required(false)
-                .takes_value(false),
-        )
-        .arg(
-            Arg::with_name("dest_account_name")
-                .short("d")
-                .long("dest-account")
-                .help("Sets destination account for each ledger transaction")
-                .required(false)
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("source_account_name")
-                .short("s")
-                .long("source-account")
-                .help("Sets source account for each ledger transaction")
-                .required(false)
-                .takes_value(true),
-        )
-        .get_matches();
-
-    let path_to_targets = matches.value_of("targets").unwrap();
-
-    let path_to_portfolio = matches.value_of("portfolio").unwrap();
-
-    let portfolio_value_index = matches
-        .value_of("portfolio_value_index")
-        .map(|x| x.parse::<usize>().unwrap())
-        .unwrap_or(1);
-
-    let contribution_amount: f64 = matches
-        .value_of("contribution")
-        .map(|x| x.parse::<f64>().unwrap())
-        .unwrap();
-
-    println!(
-        "Contributing: {}\n",
-        format!("{:.*}", 2, contribution_amount)
-    );
-
-    let target_map = create_target_map(path_to_targets);
-
-    let portfolio = create_portfolio(path_to_portfolio, portfolio_value_index, target_map);
-
-    let balanced_portfolio = lazy_rebalance(contribution_amount, portfolio);
-
-    if matches.is_present("ledger") {
-        let dest_account_name = matches
-            .value_of("dest_account_name")
-            .unwrap_or("destination_account");
-        let source_account_name = matches
-            .value_of("source_account_name")
-            .unwrap_or("source_account");
-
-        println!(
-            "{}",
-            to_ledger_string(&balanced_portfolio, dest_account_name, source_account_name)
-        );
-        return;
-    }
-
-    println!("{}", to_string(&balanced_portfolio));
-}
-
-struct Percent(f64);
-
-fn create_target_map(path_to_targets: &str) -> HashMap<String, Percent> {
-    let mut reader = csv::ReaderBuilder::new()
-        .has_headers(false)
-        .from_path(path_to_targets)
-        .unwrap();
-
-    let mut target_map = HashMap::new();
-
-    for result in reader.records() {
-        let record = result.unwrap();
-
-        let asset_name = record.get(0).unwrap().trim().to_string();
-        let allocation: Percent = {
-            let column = record.get(1).unwrap().trim();
-
-            let allocation = column.parse::<f64>().unwrap();
-
-            if allocation <= 0.0 {
-                continue;
-            }
-
-            Percent(allocation)
-        };
-
-        target_map.insert(asset_name, allocation);
-    }
-
-    target_map
-}
-
-fn create_portfolio(
-    path_to_portfolio: &str,
-    portfolio_value_index: usize,
-    target_map: HashMap<String, Percent>,
-) -> Vec<Asset> {
-    let mut reader = csv::ReaderBuilder::new()
-        .has_headers(false)
-        .from_path(path_to_portfolio)
-        .unwrap();
-
-    let mut portfolio_map: HashMap<String, Asset> = HashMap::new();
-
-    for result in reader.records() {
-        let record = result.unwrap();
-
-        let asset_name = record.get(0).unwrap().trim().to_string();
-
-        let value = {
-            let value: String = record
-                .get(portfolio_value_index)
-                .unwrap()
-                .trim()
-                .chars()
-                .skip(1)
-                .collect();
-
-            value.parse::<f64>().unwrap()
-        };
-
-        match target_map.get(&asset_name) {
-            None => {}
-            Some(&Percent(target_allocation_percent)) => {
-                let target_allocation_percent =
-                    adjust_target_allocation_percent(target_allocation_percent);
-
-                let asset = Asset::new(asset_name.clone(), target_allocation_percent, value);
-
-                portfolio_map.insert(asset_name, asset);
-            }
+                        //validate the input to be a dollar amount
+                        if !input_validation.is_match(&new_investment) {
+                            app.error_msg =
+                                "Input must be in the format of a dollar amount".to_string();
+                            app.input_mode = util::app::InputMode::ErrorDisplay;
+                        } else {
+                            //used for logging in a debug UI widget
+                            app.add_custom_event(
+                                format!("Execute Rebalance with {}", new_investment).to_string(),
+                            );
+                            app.contribution_amount = new_investment.parse().unwrap();
+                            app.lazy_rebalance();
+                            //snapshot our portfolio to a csv file
+                            app.save_portfolio().expect("Error saving portfolio");
+                            //go back to normal mode after doing the rebalance
+                            app.input_mode = InputMode::Normal;
+                            events.enable_exit_key();
+                        }
+                    }
+                    Key::Char(c) => {
+                        if c.is_numeric() || c == '.' {
+                            app.input.push(c);
+                        }
+                    }
+                    Key::Backspace => {
+                        app.input.pop();
+                    }
+                    Key::Esc => {
+                        app.input_mode = InputMode::Normal;
+                        events.enable_exit_key();
+                    }
+                    _ => {}
+                },
+                util::app::InputMode::ErrorDisplay => match input {
+                    Key::Esc => {
+                        app.input_mode = InputMode::Normal;
+                        events.enable_exit_key();
+                    }
+                    _ => {}
+                },
+            },
+            Event::Tick => {}
         }
     }
 
-    for asset_name in target_map.keys() {
-        if portfolio_map.contains_key(asset_name) {
-            continue;
-        }
-
-        let &Percent(target_allocation_percent) = target_map.get(asset_name).unwrap();
-
-        let target_allocation_percent = adjust_target_allocation_percent(target_allocation_percent);
-
-        let asset = Asset::new(asset_name.clone(), target_allocation_percent, 0.0);
-
-        portfolio_map.insert(asset_name.to_string(), asset);
-    }
-
-    let mut portfolio = vec![];
-
-    for (_asset_name, asset) in portfolio_map {
-        portfolio.push(asset);
-    }
-
-    portfolio
-}
-
-fn adjust_target_allocation_percent(target_allocation_percent: f64) -> f64 {
-    target_allocation_percent / 100.0
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_example() {
-        let path_to_targets = "example/targets.csv";
-        let path_to_portfolio = "example/portfolio.csv";
-        let contribution_amount = 10000.00;
-        let portfolio_value_index = 1;
-
-        let target_map = create_target_map(path_to_targets);
-
-        let portfolio = create_portfolio(path_to_portfolio, portfolio_value_index, target_map);
-
-        let balanced_portfolio = lazy_rebalance(contribution_amount, portfolio);
-
-        let expected = r###"
-Asset name               Asset value  Holdings %  New holdings %  Target allocation %  Target value  $ to buy/sell
-TIPS fund                6500.00      6.500       9.935           10.000               11000.00      4428.57
-Bond fund                16500.00     16.500      19.870          20.000               22000.00      5357.14
-Domestic Stock ETF       43500.00     43.500      39.740          40.000               44000.00      214.29
-International Stock ETF  33500.00     33.500      30.455          30.000               33000.00      0.00
-Total                    100000.00    100.000     100.000         100.000              110000.00     10000.00
-        "###.trim();
-
-        assert_eq!(to_string(&balanced_portfolio), expected);
-    }
+    Ok(())
 }
